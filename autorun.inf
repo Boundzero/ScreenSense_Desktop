@@ -1,0 +1,17 @@
+; This file controls how Windows presents the USB drive when inserted.
+;
+; IMPORTANT — Modern Windows behavior:
+;   - Windows 7 SP1+ ignores the "open=" directive for USB drives (anti-malware).
+;     Double-click-to-launch from inserted USB is NOT possible.
+;   - Windows DOES still honor the icon, label, and AutoPlay action entries.
+;     ScreenSense will appear in the AutoPlay popup that Windows shows on insert,
+;     letting the user click "Run ScreenSense" without navigating the drive.
+
+[autorun]
+label=ScreenSense
+icon=ScreenSense.exe,0
+action=Run ScreenSense — Screen analysis with Claude
+open=ScreenSense.exe
+shell\run=&Run ScreenSense
+shell\run\command=ScreenSense.exe
+shell=run

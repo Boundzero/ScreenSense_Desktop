@@ -1,0 +1,40 @@
+# ─── Secrets & runtime config (NEVER commit) ───────────────────────────
+# screensense.json holds API keys and Cloudflare/Telegram tokens.
+screensense.json
+*.screensense.json
+# Runtime logs and diagnostics written next to the executable.
+screensense.log
+diagnostics/
+last_quiz_capture.png
+
+# ─── Build artifacts ───────────────────────────────────────────────────
+build/
+dist/
+*.spec.bak
+*.manifest
+
+# ─── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Virtual environments ──────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ─── OS / editor cruft ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vscode/
+*.code-workspace

@@ -1,0 +1,14 @@
+# Core dependencies — required for any provider
+PySide6>=6.7.0
+mss>=9.0.1
+Pillow>=10.0.0
+ImageHash>=4.3.1
+pynput>=1.7.7
+cryptography>=42.0.0
+rapidocr-onnxruntime>=1.3.0
+
+# LLM provider SDKs — install only the ones you'll use.
+# At least one is required for the app to do anything useful.
+anthropic>=0.40.0          # for Claude (Anthropic)
+openai>=1.50.0             # for ChatGPT (OpenAI)
+google-genai>=0.4.0        # for Gemini (Google)
