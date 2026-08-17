@@ -2,6 +2,10 @@
 
 A portable Windows app that watches your screen and answers questions about it using an LLM vision API. Lives on a USB stick — no install needed.
 
+Considering Donating to help support with updates and new features!
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/B6U7259U1Y)
+
 ## What it does
 
 - **Four AI providers supported**: Claude (Anthropic), ChatGPT (OpenAI), Gemini (Google), and self-hosted **Open WebUI** (works with any OpenAI-compatible server — Ollama, vLLM, LM Studio, etc.). Pick one in the installer, or configure multiple and switch on the fly from the tray menu. Each provider's API key is stored independently and the same passphrase unlocks all of them.
