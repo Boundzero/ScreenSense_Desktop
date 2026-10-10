@@ -9,6 +9,10 @@ When building the .exe, PyInstaller uses this file as the entry point.
 """
 from __future__ import annotations
 
+import os
+os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
+os.environ["QT_SCALE_FACTOR_ROUNDING_POLICY"] = "PassThrough"
+
 import datetime
 import faulthandler
 import sys

@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtGui import QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QVBoxLayout, QWidget,
@@ -104,6 +104,76 @@ class HotkeyEdit(QLineEdit):
         self.setText("+".join(parts))
 
 
+class MouseHotkeyEdit(QLineEdit):
+    """A line edit that captures a mouse-button chord when focused.
+
+    The user clicks it (keyboard focus arrives via Tab or an initial click
+    inside the field, which we treat specially — a bare left-click on an
+    empty field is used for focus and does NOT capture). Then they press
+    the desired mouse button (optionally while holding Ctrl/Shift/Alt/Cmd)
+    and we translate the chord into our mouse hotkey format.
+
+    Supported mouse buttons: side back (XButton1), side forward (XButton2),
+    and middle (scroll wheel click). Left and right clicks are intentionally
+    not accepted — binding them would make every click fire ScreenSense.
+    """
+
+    def __init__(self, initial: str = "", parent=None):
+        super().__init__(initial, parent)
+        self.setPlaceholderText("Click, then press a mouse button (side or middle)…")
+        # Tracks whether the user has clicked INTO the field (gaining focus)
+        # or is now clicking a mouse button they want to capture. The first
+        # left-click lands focus; subsequent clicks are capture attempts.
+        self._focused_at_least_once = False
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self._focused_at_least_once = True
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        btn = event.button()
+        mods = event.modifiers()
+
+        # Left-click on an unfocused field: just take focus, don't capture.
+        # (Users need some way to activate the field without immediately
+        # binding their left mouse button.)
+        if btn == Qt.MouseButton.LeftButton and not self.hasFocus():
+            super().mousePressEvent(event)
+            return
+
+        # Right-click: always ignore (would conflict with context menus).
+        if btn == Qt.MouseButton.RightButton:
+            super().mousePressEvent(event)
+            return
+
+        # Resolve the mouse-button token.
+        token: str = ""
+        if btn == Qt.MouseButton.MiddleButton:
+            token = "middle_click"
+        elif btn == Qt.MouseButton.BackButton:
+            token = "mouse_button_4"
+        elif btn == Qt.MouseButton.ForwardButton:
+            token = "mouse_button_5"
+        elif btn == Qt.MouseButton.LeftButton and self.hasFocus():
+            # Second left-click after focus: still treat as a focus event,
+            # don't bind left-click.
+            super().mousePressEvent(event)
+            return
+        else:
+            # Any other mouse button: ignore.
+            super().mousePressEvent(event)
+            return
+
+        # Build the chord string with any modifiers held at press time.
+        parts: list[str] = []
+        for flag, modtok in _MODIFIER_TOKENS:
+            if mods & flag:
+                parts.append(modtok)
+        parts.append(token)
+        self.setText("+".join(parts))
+        event.accept()
+
+
 class SettingsDialog(QDialog):
     """Edit hotkeys and output settings. Reads/writes the passed-in Config."""
 
@@ -145,6 +215,40 @@ class SettingsDialog(QDialog):
         hk_hint.setStyleSheet("color: #A9B1BD; font-size: 11px;")
         hk_form.addRow("", hk_hint)
         layout.addWidget(hk_group)
+
+        # ---- Mouse hotkeys group (optional, additional triggers) ----
+        mh_group = QGroupBox("Mouse hotkeys (optional)")
+        mh_form = QFormLayout(mh_group)
+        self.ask_mouse_edit = MouseHotkeyEdit(config.hotkey_mouse)
+        self.quiz_mouse_edit = MouseHotkeyEdit(config.quiz_hotkey_mouse)
+        self.region_mouse_edit = MouseHotkeyEdit(config.region_hotkey_mouse)
+        self.region_quiz_mouse_edit = MouseHotkeyEdit(config.region_quiz_hotkey_mouse)
+        # Each row is the edit field + a small Clear button so the user can
+        # unbind a mouse hotkey without having to delete the text manually.
+        for label, edit in [
+            ("Ask about screen:", self.ask_mouse_edit),
+            ("Quiz mode (full screen):", self.quiz_mouse_edit),
+            ("Ask about a region:", self.region_mouse_edit),
+            ("Quiz mode on a region:", self.region_quiz_mouse_edit),
+        ]:
+            row_w = QWidget()
+            row_h = QHBoxLayout(row_w)
+            row_h.setContentsMargins(0, 0, 0, 0)
+            row_h.addWidget(edit, 1)
+            clear_btn = QPushButton("Clear")
+            clear_btn.setFixedWidth(60)
+            clear_btn.clicked.connect(edit.clear)
+            row_h.addWidget(clear_btn)
+            mh_form.addRow(label, row_w)
+        mh_hint = QLabel(
+            "Click a field, then press a side mouse button (back/forward) or "
+            "middle-click, optionally while holding Ctrl/Shift/Alt. Leave empty "
+            "to disable. Use Clear to unbind."
+        )
+        mh_hint.setWordWrap(True)
+        mh_hint.setStyleSheet("color: #A9B1BD; font-size: 11px;")
+        mh_form.addRow("", mh_hint)
+        layout.addWidget(mh_group)
 
         # ---- Output group ----
         out_group = QGroupBox("Output")
@@ -254,20 +358,60 @@ class SettingsDialog(QDialog):
             self.tg_status.setStyleSheet("color: #E85C5C; font-size: 11px;")
 
     def _accept(self) -> None:
-        # Validate hotkeys are non-empty
+        # Validate keyboard hotkeys are non-empty
         ask = self.ask_edit.text().strip()
         quiz = self.quiz_edit.text().strip()
         region = self.region_edit.text().strip()
         region_quiz = self.region_quiz_edit.text().strip()
         if not (ask and quiz and region and region_quiz):
             QMessageBox.warning(self, "Missing hotkey",
-                                "All four hotkeys must be set.")
+                                "All four keyboard hotkeys must be set.")
             return
-        # Validate they're distinct
         if len({ask, quiz, region, region_quiz}) != 4:
             QMessageBox.warning(self, "Duplicate hotkeys",
-                                "Each action needs a different hotkey.")
+                                "Each action needs a different keyboard hotkey.")
             return
+
+        # Mouse hotkeys are optional. Collect, validate, and warn as needed.
+        ask_m = self.ask_mouse_edit.text().strip()
+        quiz_m = self.quiz_mouse_edit.text().strip()
+        region_m = self.region_mouse_edit.text().strip()
+        region_quiz_m = self.region_quiz_mouse_edit.text().strip()
+        mouse_values = [v for v in (ask_m, quiz_m, region_m, region_quiz_m) if v]
+        if len(mouse_values) != len(set(mouse_values)):
+            QMessageBox.warning(
+                self, "Duplicate mouse hotkeys",
+                "Each mouse hotkey must be unique (leave blank to disable).",
+            )
+            return
+
+        # Warn if any mouse hotkey is bare "middle_click" (would break autoscroll
+        # system-wide). Only ask once per OK press.
+        plain_middle_bindings = [
+            label for label, v in [
+                ("Ask about screen", ask_m),
+                ("Quiz mode (full screen)", quiz_m),
+                ("Ask about a region", region_m),
+                ("Quiz mode on a region", region_quiz_m),
+            ] if v == "middle_click"
+        ]
+        if plain_middle_bindings:
+            affected = ", ".join(plain_middle_bindings)
+            resp = QMessageBox.warning(
+                self, "Middle-click will break autoscroll",
+                "You're binding plain middle-click (no modifier) to "
+                f"{affected}.\n\n"
+                "This will trigger ScreenSense every time you press the mouse "
+                "wheel system-wide, which breaks middle-click autoscroll in "
+                "browsers and other apps that use it.\n\n"
+                "Safer alternatives: shift+middle_click, ctrl+middle_click, "
+                "or a side mouse button (mouse_button_4 / mouse_button_5).\n\n"
+                "Continue anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                return
 
         mode = self.mode_combo.currentData()
         if mode == "telegram":
@@ -283,6 +427,10 @@ class SettingsDialog(QDialog):
         self.config.quiz_hotkey = quiz
         self.config.region_hotkey = region
         self.config.region_quiz_hotkey = region_quiz
+        self.config.hotkey_mouse = ask_m
+        self.config.quiz_hotkey_mouse = quiz_m
+        self.config.region_hotkey_mouse = region_m
+        self.config.region_quiz_hotkey_mouse = region_quiz_m
         self.config.output_mode = mode
         self.config.telegram_token = self.token_input.text().strip()
         self.config.telegram_chat_id = self.chat_input.text().strip()

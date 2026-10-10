@@ -208,11 +208,23 @@ class ScreenSenseApp(QObject):
             self.config.region_hotkey,
             self.config.region_quiz_hotkey,
         )
-        self.hotkey.ask_triggered.connect(self._capture_and_ask)
-        self.hotkey.quiz_triggered.connect(self._capture_and_quiz)
-        self.hotkey.region_triggered.connect(self._capture_region_and_ask)
-        self.hotkey.region_quiz_triggered.connect(self._capture_region_and_quiz)
+        from PySide6.QtCore import Qt as _Qt
+        self.hotkey.ask_triggered.connect(self._capture_and_ask, _Qt.ConnectionType.QueuedConnection)
+        self.hotkey.quiz_triggered.connect(self._capture_and_quiz, _Qt.ConnectionType.QueuedConnection)
+        self.hotkey.region_triggered.connect(self._capture_region_and_ask, _Qt.ConnectionType.QueuedConnection)
+        self.hotkey.region_quiz_triggered.connect(self._capture_region_and_quiz, _Qt.ConnectionType.QueuedConnection)
         self.hotkey.start()
+
+        # Optional mouse hotkeys (parallel trigger path — each action can
+        # ALSO fire from a mouse chord in addition to its keyboard hotkey).
+        # The mouse listener's callbacks route into Qt via QMetaObject so
+        # thread safety matches the keyboard side. The queued-signal shape
+        # of the triggered slots means we can just call Signal.emit from
+        # the pynput mouse thread and Qt marshals it.
+        from .mouse_hotkeys import MouseHotkeyListener
+        self.mouse_hotkey = MouseHotkeyListener()
+        self._refresh_mouse_bindings()
+        self.mouse_hotkey.start()
 
         # Worker references (Qt requires keeping them alive)
         self._worker = None
@@ -413,14 +425,34 @@ class ScreenSenseApp(QObject):
         dlg = SettingsDialog(self.config)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        # Hotkeys may have changed — rebind the global listener.
+        # Hotkeys may have changed — rebind both listeners.
         self.hotkey.rebind(
             self.config.hotkey,
             self.config.quiz_hotkey,
             self.config.region_hotkey,
             self.config.region_quiz_hotkey,
         )
+        self._refresh_mouse_bindings()
         self._update_tray_tooltip()
+
+    def _refresh_mouse_bindings(self) -> None:
+        """(Re)apply the mouse hotkey bindings from current config.
+
+        Each callback is the matching HotkeyListener signal's emit method.
+        The signals are declared with QueuedConnection on the receiving slot
+        (see initial connect calls above), so emitting from the pynput mouse
+        thread is safe — Qt marshals the call back to the main thread.
+        """
+        chords: dict = {}
+        for hk, sig in (
+            (self.config.hotkey_mouse,          self.hotkey.ask_triggered),
+            (self.config.quiz_hotkey_mouse,     self.hotkey.quiz_triggered),
+            (self.config.region_hotkey_mouse,   self.hotkey.region_triggered),
+            (self.config.region_quiz_hotkey_mouse, self.hotkey.region_quiz_triggered),
+        ):
+            if hk:
+                chords[hk] = sig.emit
+        self.mouse_hotkey.set_bindings(chords)
 
     def _on_tray_click(self, reason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -804,6 +836,8 @@ class ScreenSenseApp(QObject):
     def _quit(self) -> None:
         self._dismiss_highlight()
         self.hotkey.stop()
+        if hasattr(self, "mouse_hotkey"):
+            self.mouse_hotkey.stop()
         self.watcher.stop()
         self.watcher_thread.quit()
         self.watcher_thread.wait(1500)

@@ -35,7 +35,18 @@ QPushButton#primary:hover { background: #6079F0; }
 
 
 class Card(QWidget):
-    """Frameless, rounded, dropshadowed base widget. Draggable by its header."""
+    """Frameless, rounded, dropshadowed base widget. Draggable by its header.
+
+    IMPORTANT: this widget intentionally does NOT use WA_TranslucentBackground.
+    Translucent frameless windows on Windows go through the layered-window API
+    (UpdateLayeredWindowIndirect), which is unreliable on fractional-DPI
+    setups and multi-monitor configurations with mixed scaling — it fails
+    with "The parameter is incorrect" and the window stops repainting until
+    forced (e.g. clicked). An opaque background bypasses that pipeline
+    entirely and renders every frame reliably. The visual trade-off: the
+    panel no longer blends with what's behind it, but the dark #1E1F23
+    background still reads as a floating card against most desktops.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,24 +55,28 @@ class Card(QWidget):
             | Qt.WindowType.Tool
             | Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # NOTE: NO WA_TranslucentBackground here — see class docstring for why.
         self.setStyleSheet(STYLE)
+        # Give the widget an object name so we can style it with the #card rule.
+        self.setObjectName("card")
         self._drag_pos: QPoint | None = None
 
-    def paintEvent(self, _):
-        # Manual rounded-rect paint so shadow effect doesn't clip awkwardly.
+    def paintEvent(self, event):
+        # Simple opaque rounded-rect fill. No translucent compositing; renders
+        # fast and reliably on any DPI configuration.
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         path = QPainterPath()
-        path.addRoundedRect(self.rect().adjusted(12, 12, -12, -12), 14, 14)
+        path.addRoundedRect(self.rect(), 14, 14)
         p.fillPath(path, QBrush(QColor("#1E1F23")))
+        super().paintEvent(event)
 
     def add_shadow(self) -> None:
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(40)
-        shadow.setOffset(0, 6)
-        shadow.setColor(QColor(0, 0, 0, 180))
-        self.setGraphicsEffect(shadow)
+        # Drop shadow uses the graphics effect pipeline, which requires
+        # translucency around the widget to look right. Since we've gone
+        # opaque for reliability, we skip the shadow — the dark card against
+        # a lighter desktop still reads as "floating" without it.
+        pass
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:

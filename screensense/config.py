@@ -58,6 +58,14 @@ class Config:
     quiz_hotkey: str = "ctrl+shift+q"
     region_hotkey: str = "ctrl+shift+r"
     region_quiz_hotkey: str = "ctrl+shift+z"
+    # Optional mouse-button hotkeys. Each action can additionally be triggered
+    # by a mouse chord (with or without keyboard modifiers). Empty string = no
+    # mouse binding for that action. Format examples: "mouse_button_5",
+    # "ctrl+mouse_button_4", "shift+middle_click", "middle_click".
+    hotkey_mouse: str = ""
+    quiz_hotkey_mouse: str = ""
+    region_hotkey_mouse: str = ""
+    region_quiz_hotkey_mouse: str = ""
     poll_fps: float = 2.0
     auto_suggest: bool = True
 
