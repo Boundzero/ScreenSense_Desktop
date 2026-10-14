@@ -76,6 +76,16 @@ class Config:
     telegram_token: str = ""             # bot token from @BotFather
     telegram_chat_id: str = ""           # destination chat id
 
+    # Remote trigger server. When enabled, ScreenSense serves a small mobile
+    # web page on the LAN. Any device with the shared bookmark URL (which
+    # includes a secret token) can trigger ask/quiz actions remotely. For
+    # these remote triggers, the answer ALWAYS routes to Telegram regardless
+    # of output_mode — the whole point is to keep the host computer silent.
+    # Requires Telegram to be configured (token + chat_id).
+    trigger_server_enabled: bool = False
+    trigger_server_port: int = 7474
+    trigger_server_token: str = ""       # auto-generated when enabled
+
     # Highlight overlay accessibility settings
     highlight_dim_background: bool = True
     highlight_pulse: bool = True

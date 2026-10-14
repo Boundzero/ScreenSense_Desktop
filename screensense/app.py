@@ -208,11 +208,10 @@ class ScreenSenseApp(QObject):
             self.config.region_hotkey,
             self.config.region_quiz_hotkey,
         )
-        from PySide6.QtCore import Qt as _Qt
-        self.hotkey.ask_triggered.connect(self._capture_and_ask, _Qt.ConnectionType.QueuedConnection)
-        self.hotkey.quiz_triggered.connect(self._capture_and_quiz, _Qt.ConnectionType.QueuedConnection)
-        self.hotkey.region_triggered.connect(self._capture_region_and_ask, _Qt.ConnectionType.QueuedConnection)
-        self.hotkey.region_quiz_triggered.connect(self._capture_region_and_quiz, _Qt.ConnectionType.QueuedConnection)
+        self.hotkey.ask_triggered.connect(self._capture_and_ask)
+        self.hotkey.quiz_triggered.connect(self._capture_and_quiz)
+        self.hotkey.region_triggered.connect(self._capture_region_and_ask)
+        self.hotkey.region_quiz_triggered.connect(self._capture_region_and_quiz)
         self.hotkey.start()
 
         # Optional mouse hotkeys (parallel trigger path — each action can
@@ -233,6 +232,81 @@ class ScreenSenseApp(QObject):
         self._quiz_thread = None
         self._active_highlight: Optional[HighlightOverlay] = None
         self._active_picker: Optional[RegionPicker] = None
+
+        # Per-request Telegram override. Set to True by remote-trigger
+        # requests just before emitting an action signal, so the output
+        # path routes to Telegram regardless of global output_mode. Cleared
+        # by the finish/fail handlers.
+        self._force_telegram: bool = False
+
+        # Optional remote trigger server (opt-in via Settings).
+        self.trigger_server = None
+        self._maybe_start_trigger_server()
+
+    def _maybe_start_trigger_server(self) -> None:
+        """Start the HTTP trigger server if enabled in config.
+
+        Called on startup and whenever settings change. Safe to call when
+        server is already running — stops the old instance first.
+        """
+        # Stop any existing server before (re)evaluating config.
+        if self.trigger_server is not None:
+            try:
+                self.trigger_server.stop()
+            except Exception:
+                pass
+            self.trigger_server = None
+
+        if not self.config.trigger_server_enabled:
+            return
+        if not self.config.trigger_server_token:
+            # Enabled but no token saved — generate one and persist.
+            from .trigger_server import generate_token
+            self.config.trigger_server_token = generate_token()
+            self.config.save()
+
+        from .trigger_server import TriggerServer
+        try:
+            self.trigger_server = TriggerServer(
+                port=int(self.config.trigger_server_port or 7474),
+                token=self.config.trigger_server_token,
+                on_trigger=self._handle_remote_trigger,
+            )
+            self.trigger_server.start()
+            import sys
+            print(
+                f"[ScreenSense] Remote trigger server listening on port "
+                f"{self.config.trigger_server_port}",
+                file=sys.stderr, flush=True,
+            )
+        except Exception as e:
+            import sys
+            print(f"[ScreenSense] Failed to start trigger server: {e}",
+                  file=sys.stderr, flush=True)
+            self.trigger_server = None
+
+    def _handle_remote_trigger(self, action: str) -> tuple[bool, str]:
+        """Called by the HTTP server when a web-page button is tapped.
+
+        Runs on the HTTP worker thread. We set the force-telegram flag
+        and emit the matching signal; signal delivery is QueuedConnection
+        so the actual capture + LLM call happens on the Qt main thread.
+
+        Returns (ok, error_message). The web page displays the error to
+        the user if ok=False.
+        """
+        if not (self.config.telegram_token and self.config.telegram_chat_id):
+            return (False, "Telegram is not configured on the host. "
+                           "Set it up in Settings → Output.")
+        self._force_telegram = True
+        if action == "ask":
+            self.hotkey.ask_triggered.emit()
+        elif action == "quiz":
+            self.hotkey.quiz_triggered.emit()
+        else:
+            self._force_telegram = False
+            return (False, f"Unknown action: {action}")
+        return (True, "")
 
     # --- frame & event handlers ---
 
@@ -377,7 +451,15 @@ class ScreenSenseApp(QObject):
         self._ask_about(frame, question="There's likely an error on this screen. Identify it and explain how to fix it.")
 
     def _telegram_mode(self) -> bool:
-        """True if answers should go to Telegram instead of the screen."""
+        """True if answers should go to Telegram instead of the screen.
+
+        Honors a per-request override (`_force_telegram`) so remote-trigger
+        requests always route to Telegram regardless of global output_mode.
+        The override is set just before emitting a trigger signal and cleared
+        when the request finishes (see _on_finished / _on_quiz_finished).
+        """
+        if getattr(self, "_force_telegram", False):
+            return bool(self.config.telegram_token) and bool(self.config.telegram_chat_id)
         return (
             self.config.output_mode == "telegram"
             and bool(self.config.telegram_token)
@@ -433,6 +515,8 @@ class ScreenSenseApp(QObject):
             self.config.region_quiz_hotkey,
         )
         self._refresh_mouse_bindings()
+        # Trigger server settings may have changed — restart if needed.
+        self._maybe_start_trigger_server()
         self._update_tray_tooltip()
 
     def _refresh_mouse_bindings(self) -> None:
@@ -643,6 +727,14 @@ class ScreenSenseApp(QObject):
             return None
 
     def _on_quiz_finished(self, result: QuizResult) -> None:
+        try:
+            self._on_quiz_finished_impl(result)
+        finally:
+            # Clear per-request Telegram override (set by remote-trigger
+            # requests) no matter how the handler exited.
+            self._force_telegram = False
+
+    def _on_quiz_finished_impl(self, result: QuizResult) -> None:
         if not result.found_question or not result.answers:
             # The model didn't see a question.
             if self._telegram_mode():
@@ -826,9 +918,19 @@ class ScreenSenseApp(QObject):
             self._send_telegram(full_text)
         else:
             self.panel.finish()
+        # Clear per-request Telegram override (set by remote-trigger requests).
+        self._force_telegram = False
 
     def _on_failed(self, msg: str) -> None:
-        self.panel.show_error(msg)
+        # If this request was triggered remotely (force_telegram) and we have
+        # Telegram configured, deliver the error there instead of popping an
+        # on-screen panel the user may not be near. Falls through to on-screen
+        # if Telegram isn't configured (never silent).
+        if getattr(self, "_force_telegram", False) and self._telegram_mode():
+            self._telegram_notice(f"ScreenSense error: {msg}")
+        else:
+            self.panel.show_error(msg)
+        self._force_telegram = False
 
     def _reset_conversation(self) -> None:
         self.conversation = Conversation()
@@ -838,6 +940,11 @@ class ScreenSenseApp(QObject):
         self.hotkey.stop()
         if hasattr(self, "mouse_hotkey"):
             self.mouse_hotkey.stop()
+        if getattr(self, "trigger_server", None) is not None:
+            try:
+                self.trigger_server.stop()
+            except Exception:
+                pass
         self.watcher.stop()
         self.watcher_thread.quit()
         self.watcher_thread.wait(1500)

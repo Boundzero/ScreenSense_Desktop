@@ -10,10 +10,11 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeyEvent, QMouseEvent
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QPixmap, QImage
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 from .config import Config
@@ -271,6 +272,9 @@ class SettingsDialog(QDialog):
         self.token_input = QLineEdit(config.telegram_token)
         self.token_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.token_input.setPlaceholderText("123456:ABC-DEF… (from @BotFather)")
+        self.token_input.textChanged.connect(
+            lambda _=None: self._update_rt_help() if hasattr(self, "rt_help") else None
+        )
         tg_form.addRow("Bot token:", self.token_input)
 
         chat_row = QWidget()
@@ -278,6 +282,9 @@ class SettingsDialog(QDialog):
         chat_h.setContentsMargins(0, 0, 0, 0)
         self.chat_input = QLineEdit(config.telegram_chat_id)
         self.chat_input.setPlaceholderText("e.g. 123456789")
+        self.chat_input.textChanged.connect(
+            lambda _=None: self._update_rt_help() if hasattr(self, "rt_help") else None
+        )
         chat_h.addWidget(self.chat_input, 1)
         self.fetch_chat_btn = QPushButton("Auto-detect")
         self.fetch_chat_btn.clicked.connect(self._fetch_chat_id)
@@ -308,6 +315,76 @@ class SettingsDialog(QDialog):
 
         out_layout.addWidget(self.tg_widget)
         layout.addWidget(out_group)
+
+        # ---- Remote Trigger server ----
+        rt_group = QGroupBox("Remote trigger (phone / tablet / browser)")
+        rt_layout = QVBoxLayout(rt_group)
+
+        self.rt_enable = QCheckBox(
+            "Enable remote trigger server (serve a web page on the LAN)"
+        )
+        self.rt_enable.setChecked(config.trigger_server_enabled)
+        self.rt_enable.toggled.connect(self._on_rt_toggle)
+        rt_layout.addWidget(self.rt_enable)
+
+        # Everything that only matters when enabled lives in rt_widget so we
+        # can hide it as a group.
+        self.rt_widget = QWidget()
+        rt_inner = QVBoxLayout(self.rt_widget)
+        rt_inner.setContentsMargins(0, 8, 0, 0)
+
+        # Port
+        port_row = QHBoxLayout()
+        port_row.addWidget(QLabel("Port:"))
+        self.rt_port = QSpinBox()
+        self.rt_port.setRange(1024, 65535)
+        self.rt_port.setValue(int(config.trigger_server_port or 7474))
+        self.rt_port.valueChanged.connect(self._refresh_rt_url)
+        port_row.addWidget(self.rt_port)
+        port_row.addStretch()
+        rt_inner.addLayout(port_row)
+
+        # Token row with regenerate button
+        tok_row = QHBoxLayout()
+        tok_row.addWidget(QLabel("Access token:"))
+        self.rt_token = QLineEdit(config.trigger_server_token)
+        self.rt_token.setReadOnly(True)
+        self.rt_token.setPlaceholderText("(generated when you enable)")
+        tok_row.addWidget(self.rt_token, 1)
+        regen_btn = QPushButton("Regenerate")
+        regen_btn.clicked.connect(self._regenerate_token)
+        tok_row.addWidget(regen_btn)
+        rt_inner.addLayout(tok_row)
+
+        # URL display
+        url_row = QHBoxLayout()
+        url_row.addWidget(QLabel("Bookmark URL:"))
+        self.rt_url_display = QLineEdit("")
+        self.rt_url_display.setReadOnly(True)
+        url_row.addWidget(self.rt_url_display, 1)
+        copy_btn = QPushButton("Copy")
+        copy_btn.clicked.connect(self._copy_url)
+        url_row.addWidget(copy_btn)
+        rt_inner.addLayout(url_row)
+
+        # QR code display
+        self.rt_qr_label = QLabel("")
+        self.rt_qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.rt_qr_label.setStyleSheet("background: white; padding: 8px; border-radius: 8px;")
+        rt_inner.addWidget(self.rt_qr_label)
+
+        # Help / warning text
+        self.rt_help = QLabel("")
+        self.rt_help.setWordWrap(True)
+        self.rt_help.setStyleSheet("color: #A9B1BD; font-size: 11px;")
+        rt_inner.addWidget(self.rt_help)
+
+        rt_layout.addWidget(self.rt_widget)
+        layout.addWidget(rt_group)
+
+        # Initial state
+        self._refresh_rt_url()
+        self._on_rt_toggle()
 
         # ---- OK / Cancel ----
         buttons = QDialogButtonBox(
@@ -356,6 +433,107 @@ class SettingsDialog(QDialog):
         except Exception as e:
             self.tg_status.setText(str(e))
             self.tg_status.setStyleSheet("color: #E85C5C; font-size: 11px;")
+
+    def _on_rt_toggle(self, *_args) -> None:
+        """Show/hide the inner config, and auto-generate a token on first enable."""
+        enabled = self.rt_enable.isChecked()
+        self.rt_widget.setVisible(enabled)
+        if enabled and not self.rt_token.text().strip():
+            from .trigger_server import generate_token
+            self.rt_token.setText(generate_token())
+            self._refresh_rt_url()
+        self._update_rt_help()
+
+    def _regenerate_token(self) -> None:
+        from .trigger_server import generate_token
+        resp = QMessageBox.question(
+            self, "Regenerate token?",
+            "A new token will be generated and the old bookmarks on your "
+            "phones/tablets will stop working. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        self.rt_token.setText(generate_token())
+        self._refresh_rt_url()
+
+    def _refresh_rt_url(self) -> None:
+        """Rebuild the bookmark URL display and QR code when port or token changes."""
+        from .trigger_server import detect_lan_ip
+        host = detect_lan_ip()
+        port = self.rt_port.value()
+        token = self.rt_token.text().strip()
+        if not token:
+            self.rt_url_display.setText("")
+            self.rt_qr_label.clear()
+            self.rt_qr_label.setFixedHeight(0)
+            return
+        url = f"http://{host}:{port}/?t={token}"
+        self.rt_url_display.setText(url)
+        self._render_qr(url)
+
+    def _render_qr(self, url: str) -> None:
+        """Render the URL as a QR code into rt_qr_label. Silently no-op if
+        the qrcode library isn't installed (we show the URL text instead)."""
+        try:
+            import qrcode
+            from io import BytesIO
+            qr = qrcode.QRCode(box_size=6, border=2)
+            qr.add_data(url)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            qimg = QImage.fromData(buf.getvalue(), "PNG")
+            pix = QPixmap.fromImage(qimg)
+            self.rt_qr_label.setPixmap(pix)
+            self.rt_qr_label.setFixedHeight(pix.height() + 16)
+        except ImportError:
+            self.rt_qr_label.clear()
+            self.rt_qr_label.setText(
+                "(Install 'qrcode' to see a scannable QR here.)"
+            )
+            self.rt_qr_label.setStyleSheet(
+                "color: #A9B1BD; font-size: 11px; padding: 8px;"
+            )
+        except Exception as e:
+            self.rt_qr_label.clear()
+            self.rt_qr_label.setText(f"(QR render failed: {e})")
+
+    def _copy_url(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        text = self.rt_url_display.text().strip()
+        if text:
+            QApplication.clipboard().setText(text)
+
+    def _update_rt_help(self) -> None:
+        """Keep the help text accurate — warn about Telegram requirement."""
+        tg_ok = bool(self.token_input.text().strip() and self.chat_input.text().strip())
+        tg_mode_on = self.mode_combo.currentData() == "telegram"
+        if tg_ok:
+            msg = (
+                "Scan the QR code with your phone, or copy the URL to any device. "
+                "Open it in a browser and tap 'Ask Screen' or 'Quiz Mode'. "
+                "Answers are sent to Telegram so the host screen stays silent. "
+                "The URL is a shared secret — anyone with it can trigger captures. "
+                "Click Regenerate to invalidate old bookmarks."
+            )
+            if not tg_mode_on:
+                msg += (
+                    "\n\nNote: your default output mode is 'screen', but remote "
+                    "triggers always route to Telegram regardless."
+                )
+            color = "#A9B1BD"
+        else:
+            msg = (
+                "⚠ Remote trigger requires Telegram to be configured (bot token + "
+                "chat ID above). Set those up first, otherwise triggers will fail "
+                "with 'Telegram not configured'."
+            )
+            color = "#E85C5C"
+        self.rt_help.setText(msg)
+        self.rt_help.setStyleSheet(f"color: {color}; font-size: 11px;")
 
     def _accept(self) -> None:
         # Validate keyboard hotkeys are non-empty
@@ -434,5 +612,9 @@ class SettingsDialog(QDialog):
         self.config.output_mode = mode
         self.config.telegram_token = self.token_input.text().strip()
         self.config.telegram_chat_id = self.chat_input.text().strip()
+        # Remote trigger server
+        self.config.trigger_server_enabled = self.rt_enable.isChecked()
+        self.config.trigger_server_port = self.rt_port.value()
+        self.config.trigger_server_token = self.rt_token.text().strip()
         self.config.save()
         self.accept()
