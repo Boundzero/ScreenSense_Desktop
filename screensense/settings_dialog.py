@@ -13,8 +13,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeyEvent, QMouseEvent, QPixmap, QImage
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox,
-    QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
+    QSpinBox, QVBoxLayout, QWidget,
 )
 
 from .config import Config
@@ -193,9 +193,35 @@ class SettingsDialog(QDialog):
             + "QComboBox { background: #2A2C32; border: 1px solid #3A3D45;"
             + " border-radius: 6px; padding: 6px 10px; }"
         )
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(540)
 
-        layout = QVBoxLayout(self)
+        # Outer dialog layout: scroll area + fixed button bar.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Scrollable container for all the sections. The content widget's
+        # own layout is called `layout` (the name the rest of __init__ uses)
+        # so the section-building code below reads unchanged.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            "QScrollArea { background: #1E1F23; }"
+            "QScrollBar:vertical { background: #1E1F23; width: 10px; margin: 0; }"
+            "QScrollBar::handle:vertical { background: #3A3D45; border-radius: 5px;"
+            " min-height: 20px; }"
+            "QScrollBar::handle:vertical:hover { background: #4A4E57; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }"
+        )
+        content = QWidget()
+        content.setStyleSheet("background: #1E1F23;")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(12, 12, 12, 12)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
 
         # ---- Hotkeys group ----
         hk_group = QGroupBox("Hotkeys")
@@ -386,15 +412,33 @@ class SettingsDialog(QDialog):
         self._refresh_rt_url()
         self._on_rt_toggle()
 
-        # ---- OK / Cancel ----
+        # ---- OK / Cancel (fixed at the bottom, outside the scroll area) ----
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        # Pad the button bar so it visually matches the scrollable content.
+        button_wrap = QWidget()
+        button_wrap.setStyleSheet("background: #1E1F23;")
+        bw = QVBoxLayout(button_wrap)
+        bw.setContentsMargins(12, 8, 12, 12)
+        bw.addWidget(buttons)
+        outer.addWidget(button_wrap)
 
         self._on_mode_change()  # set initial visibility
+
+        # Size the dialog: ideally wide enough for all content, tall enough
+        # to show most sections without scrolling — but never taller than
+        # ~85% of the screen's available height so OK/Cancel always visible.
+        from PySide6.QtGui import QGuiApplication
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            max_h = int(avail.height() * 0.85)
+            # Default to a sensible 720px height, capped at screen max.
+            self.resize(560, min(720, max_h))
+            self.setMaximumHeight(max_h)
 
     def _on_mode_change(self, *_args) -> None:
         is_tg = self.mode_combo.currentData() == "telegram"

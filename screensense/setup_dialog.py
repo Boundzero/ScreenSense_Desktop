@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QObject, QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel,
     QLineEdit, QMessageBox, QVBoxLayout,
@@ -17,6 +17,60 @@ from PySide6.QtWidgets import (
 from .config import Config, encrypt_api_key, decrypt_api_key
 from .providers import PROVIDERS
 from .ui import STYLE
+
+
+class _ProviderTestWorker(QObject):
+    """Background worker that instantiates a provider and runs a tiny test
+    request to verify the key + model + URL combination works.
+
+    Emits `finished(ok: bool, message: str)` when done. The message is
+    user-friendly: either confirms success or explains the failure.
+    """
+    finished = Signal(bool, str)
+
+    def __init__(self, provider_id: str, api_key: str, model: str, extras: dict):
+        super().__init__()
+        self._provider_id = provider_id
+        self._api_key = api_key
+        self._model = model
+        self._extras = extras
+
+    def run(self) -> None:
+        try:
+            from .providers import make_provider, Conversation, Turn
+            provider = make_provider(
+                self._provider_id, self._api_key, self._model, **self._extras
+            )
+            # Trivial one-turn conversation — text-only, no image. Any
+            # non-empty response = key + model + endpoint all working.
+            conv = Conversation(turns=[Turn(role="user", text="Reply with just: OK")])
+            got_chunk = False
+            for chunk in provider.stream(conv, system_prompt="You are a test probe. Reply with 'OK'.", max_tokens=16):
+                if chunk:
+                    got_chunk = True
+                    break   # one chunk is enough — we just needed to confirm it works
+            if got_chunk:
+                self.finished.emit(True, f"✓ Working. Model '{self._model}' responded successfully.")
+            else:
+                self.finished.emit(False, "Model returned an empty response — check that this model supports chat.")
+        except Exception as e:
+            # Surface the most actionable part of the error.
+            msg = str(e) or type(e).__name__
+            # Common error patterns worth hinting about:
+            lower = msg.lower()
+            if "401" in msg or "unauthorized" in lower or "invalid_api_key" in lower:
+                hint = " — API key rejected. Check it's correct and hasn't expired."
+            elif "404" in msg or "not found" in lower or "model_not_found" in lower:
+                hint = f" — model '{self._model}' not found on this account. Check the exact model ID."
+            elif "403" in msg or "permission" in lower or "access" in lower:
+                hint = " — access denied. Your account may not have this model enabled."
+            elif "timeout" in lower or "timed out" in lower:
+                hint = " — request timed out. Check your network and the server URL."
+            elif "ssl" in lower or "certificate" in lower:
+                hint = " — SSL error. For self-hosted servers, try enabling 'Skip TLS verification'."
+            else:
+                hint = ""
+            self.finished.emit(False, f"✗ Failed: {msg[:200]}{hint}")
 
 
 PROVIDER_INFO = {
@@ -108,14 +162,31 @@ class SetupDialog(QDialog):
         self.key_help.setStyleSheet("color: #A9B1BD; font-size: 11px;")
         form.addRow("", self.key_help)
 
-        # Model picker (filled in based on chosen provider)
+        # Model picker (filled in based on chosen provider).
+        # Editable so custom/newly-released model IDs can be typed in — a
+        # curated dropdown appears as suggestions.
+        from PySide6.QtWidgets import QPushButton, QHBoxLayout, QWidget
         self.model_combo = QComboBox()
-        self.model_combo.setEditable(False)
-        form.addRow("Model:", self.model_combo)
+        self.model_combo.setEditable(True)
+        model_row = QWidget()
+        mr = QHBoxLayout(model_row)
+        mr.setContentsMargins(0, 0, 0, 0)
+        mr.addWidget(self.model_combo, 1)
+        self.test_btn = QPushButton("Test")
+        self.test_btn.setToolTip("Send a tiny test request to verify the provider, "
+                                 "API key, and model all work.")
+        self.test_btn.clicked.connect(self._test_provider)
+        mr.addWidget(self.test_btn)
+        form.addRow("Model:", model_row)
+
+        # Status line shown under the model row for test / fetch results.
+        self.model_status = QLabel("")
+        self.model_status.setWordWrap(True)
+        self.model_status.setStyleSheet("color: #A9B1BD; font-size: 11px;")
+        form.addRow("", self.model_status)
 
         # For Open WebUI: a button to fetch the model list from the server.
         # Hidden for cloud providers since their model lists are hardcoded.
-        from PySide6.QtWidgets import QPushButton, QHBoxLayout, QWidget
         self.fetch_btn = QPushButton("Fetch models from server")
         self.fetch_btn.clicked.connect(self._fetch_openwebui_models)
         self.fetch_status = QLabel("")
@@ -237,18 +308,22 @@ class SetupDialog(QDialog):
         if needs_url:
             self.url_input.setPlaceholderText(info.get("url_format", ""))
 
-        # Update model list
+        # Update model list. ALL providers now use editable combos so the
+        # user can type a brand-new model ID the moment a provider ships it
+        # (e.g. a new Claude or Gemini release) without waiting for an app
+        # update. Curated entries still appear as a dropdown of suggestions.
         self.model_combo.clear()
+        self.model_combo.setEditable(True)
         if not models:
             # Open WebUI: no hardcoded catalog. User clicks "Fetch models"
-            # after entering URL+key, or types one manually if the combo is
-            # set editable.
-            self.model_combo.setEditable(True)
+            # after entering URL+key, or types one manually.
             self.model_combo.lineEdit().setPlaceholderText(
-                "Click 'Fetch models' after entering URL and key"
+                "Click 'Fetch models' after entering URL and key, or type a model ID"
             )
         else:
-            self.model_combo.setEditable(False)
+            self.model_combo.lineEdit().setPlaceholderText(
+                "Pick a model or type a custom model ID"
+            )
             default_idx = 0
             for i, (model_id, label) in enumerate(models):
                 self.model_combo.addItem(label, model_id)
@@ -303,6 +378,103 @@ class SetupDialog(QDialog):
         self.fetch_status.setText(f"Found {len(models)} models.")
         self.fetch_status.setStyleSheet("color: #56B25A; font-size: 11px;")
 
+    def _resolve_model_id(self) -> str:
+        """Return the model ID the user actually wants.
+
+        Editable QComboBox has a subtle trap: after you type over the
+        selected item's text, `currentData()` keeps returning the OLD
+        item's data until focus leaves and reselects. So we can't trust
+        currentData() alone when the combo is editable. Compare the live
+        text to the currently-indexed item's label — if they differ, the
+        user has typed a custom ID, and the typed text IS the model ID.
+        """
+        text = self.model_combo.currentText().strip()
+        if not text:
+            return ""
+        idx = self.model_combo.currentIndex()
+        if idx >= 0:
+            item_label = self.model_combo.itemText(idx)
+            if text == item_label:
+                # Text matches the selected item's label — trust its data.
+                data = self.model_combo.itemData(idx)
+                if data:
+                    return str(data)
+        # Either no item selected, or the text has been edited away from
+        # the item's label. The typed text is the model ID.
+        return text
+
+    def _test_provider(self) -> None:
+        """Send a tiny test request to verify the current form config works.
+
+        Validates: API key accepted, model ID valid for the account, URL
+        reachable (if self-hosted), and overall that a request completes. Does
+        NOT send an image — that would be a quiz test. This is a connectivity
+        + model-ID test.
+
+        Runs on a background QThread so the UI stays responsive during the
+        several-seconds API call.
+        """
+        pid = self.provider_combo.currentData()
+        info = PROVIDER_INFO[pid]
+        key = self.key_input.text().strip()
+        if not key:
+            self._set_model_status("Enter an API key first.", "err")
+            return
+        model = self._resolve_model_id()
+        if not model:
+            self._set_model_status("Enter or pick a model ID first.", "err")
+            return
+        # Base URL (self-hosted) and CF Access extras.
+        base_url = ""
+        extras: dict = {}
+        if info.get("needs_base_url"):
+            base_url = self.url_input.text().strip()
+            if not base_url:
+                self._set_model_status("Enter the server URL first.", "err")
+                return
+            extras["base_url"] = base_url
+            cf_id = self.cf_id_input.text().strip()
+            cf_secret = self.cf_secret_input.text().strip()
+            if cf_id or cf_secret:
+                if not (cf_id and cf_secret):
+                    self._set_model_status(
+                        "Enter both Cloudflare Access ID and Secret, or neither.", "err"
+                    )
+                    return
+                extras["cf_access_client_id"] = cf_id
+                extras["cf_access_client_secret"] = cf_secret
+            if self.cf_insecure_chk.isChecked():
+                extras["tls_insecure"] = True
+
+        # Disable the button and show "Testing..." while the worker runs.
+        self.test_btn.setEnabled(False)
+        self._set_model_status(f"Testing {pid} with model '{model}'…", "working")
+
+        # Kick off the worker thread.
+        self._test_worker = _ProviderTestWorker(pid, key, model, extras)
+        self._test_thread = QThread(self)
+        self._test_worker.moveToThread(self._test_thread)
+        self._test_thread.started.connect(self._test_worker.run)
+        self._test_worker.finished.connect(self._on_test_finished, Qt.ConnectionType.QueuedConnection)
+        self._test_worker.finished.connect(self._test_thread.quit)
+        self._test_thread.finished.connect(self._test_thread.deleteLater)
+        self._test_thread.start()
+
+    def _on_test_finished(self, ok: bool, message: str) -> None:
+        self.test_btn.setEnabled(True)
+        self._set_model_status(message, "ok" if ok else "err")
+
+    def _set_model_status(self, text: str, kind: str = "") -> None:
+        """Set the status line below the model row. kind: '' | 'ok' | 'err' | 'working'"""
+        colors = {
+            "ok": "#56B25A",
+            "err": "#E85C5C",
+            "working": "#6B8AFF",
+            "": "#A9B1BD",
+        }
+        self.model_status.setText(text)
+        self.model_status.setStyleSheet(f"color: {colors[kind]}; font-size: 11px;")
+
     def _accept(self) -> None:
         pid = self.provider_combo.currentData()
         info = PROVIDER_INFO[pid]
@@ -341,11 +513,8 @@ class SetupDialog(QDialog):
 
         self.result_provider = pid
         self.result_key = key
-        # currentData() returns None when the combo is in editable mode and
-        # the user typed a model name. Fall back to currentText() in that case.
-        model = self.model_combo.currentData()
-        if not model:
-            model = self.model_combo.currentText().strip()
+        # See _resolve_model_id for the editable-combo staleness explanation.
+        model = self._resolve_model_id()
         self.result_model = model or None
         if not self.result_model:
             QMessageBox.warning(self, "Missing model",
